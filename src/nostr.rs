@@ -1,0 +1,113 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use nostr_sdk::{Client, Filter, Kind, PublicKey, RelayMessage, RelayPoolNotification, Timestamp};
+use tracing::{info, warn};
+
+use crate::error::AppError;
+use crate::keys::KeyStore;
+use crate::state::{AppState, NostrSender};
+use crate::transport::UserAgentTransport;
+
+pub struct NostrBridge {
+    client: Client,
+}
+
+impl NostrBridge {
+    pub async fn connect(keys: &KeyStore, relays: &[String]) -> Result<Self, AppError> {
+        let nostr_keys = keys.nostr_keys()?;
+        let client = Client::builder()
+            .signer(nostr_keys)
+            .websocket_transport(UserAgentTransport)
+            .build();
+
+        for relay in relays {
+            client
+                .add_relay(relay.as_str())
+                .await
+                .map_err(|e| AppError::Nostr(e.to_string()))?;
+        }
+        client.connect().await;
+        info!("Connected to {} Nostr relay(s)", relays.len());
+
+        Ok(Self { client })
+    }
+
+    pub async fn listen(self: Arc<Self>, state: Arc<AppState>) -> Result<(), AppError> {
+        let my_pubkey = state.keys.nostr_keys()?.public_key();
+
+        // NIP-59 gift wrap events have intentionally backdated created_at (up to 48h).
+        let since = Timestamp::now() - 2 * 24 * 60 * 60;
+        let filter = Filter::new()
+            .kind(Kind::GiftWrap)
+            .pubkey(my_pubkey)
+            .since(since);
+
+        self.client
+            .subscribe(filter, None)
+            .await
+            .map_err(|e| AppError::Nostr(e.to_string()))?;
+
+        info!("Nostr listener subscribed for pubkey={}", my_pubkey);
+
+        let client = self.client.clone();
+        self.client
+            .handle_notifications(|notification| {
+                let state = state.clone();
+                let client = client.clone();
+                async move {
+                    match notification {
+                        RelayPoolNotification::Event { event, .. } => {
+                            if event.kind == Kind::GiftWrap {
+                                match client.unwrap_gift_wrap(&event).await {
+                                    Ok(gift) => {
+                                        let content = gift.rumor.content.clone();
+                                        let channel_id = state.config.channel_id;
+                                        if let Err(e) =
+                                            state.discord.send_message(channel_id, &content).await
+                                        {
+                                            warn!("Failed to forward to Discord: {}", e);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to unwrap NIP-17: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                        RelayPoolNotification::Message { relay_url, message } => {
+                            if let RelayMessage::Auth { challenge } = message {
+                                let preview: String = challenge.chars().take(16).collect();
+                                info!(
+                                    "NIP-42 AUTH challenge from {} (challenge={}…)",
+                                    relay_url, preview
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                    Ok(false)
+                }
+            })
+            .await
+            .map_err(|e| AppError::Nostr(e.to_string()))?;
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl NostrSender for NostrBridge {
+    async fn send_dm(&self, to_npub: &str, content: &str) -> Result<(), AppError> {
+        let recipient = PublicKey::parse(to_npub)
+            .map_err(|e| AppError::Nostr(format!("invalid npub: {e}")))?;
+
+        self.client
+            .send_private_msg(recipient, content, std::iter::empty::<nostr_sdk::Tag>())
+            .await
+            .map_err(|e| AppError::Nostr(e.to_string()))?;
+
+        info!("Sent NIP-17 DM to {}", to_npub);
+        Ok(())
+    }
+}
