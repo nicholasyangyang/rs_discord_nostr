@@ -97,7 +97,7 @@ async fn test_nostr_to_discord_sends_to_channel() {
 }
 
 #[tokio::test]
-async fn test_multiple_messages_ordered() {
+async fn test_multiple_messages_all_sent() {
     let nostr = MockNostr::new();
     let discord = MockDiscord::new();
     let (state, _dir) = make_state(nostr.clone(), discord);

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use nostr_sdk::{Client, Filter, Kind, PublicKey, RelayMessage, RelayPoolNotification, Timestamp};
+use nostr_sdk::{Client, Filter, Kind, PublicKey, RelayMessage, RelayPoolNotification, Timestamp, ToBech32};
 use tracing::{info, warn};
 
 use crate::error::AppError;
@@ -61,6 +61,11 @@ impl NostrBridge {
                             if event.kind == Kind::GiftWrap {
                                 match client.unwrap_gift_wrap(&event).await {
                                     Ok(gift) => {
+                                        let sender_npub = gift.rumor.pubkey.to_bech32().unwrap_or_default();
+                                        if sender_npub != state.config.msg_to {
+                                            warn!("Ignoring DM from unexpected sender: {}", sender_npub);
+                                            return Ok(false);
+                                        }
                                         let content = gift.rumor.content.clone();
                                         let channel_id = state.config.channel_id;
                                         if let Err(e) =
